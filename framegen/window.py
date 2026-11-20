@@ -15,9 +15,14 @@ How it works:
 - SmoovPlay's own window sits on top as a click-through overlay that never takes the focus (the app keeps it:
   some apps stop updating without it), and is left out of the capture (io.py, exclude_from_capture: Windows'
   WDA_EXCLUDEFROMCAPTURE, Windows 10 2004 or newer), so the capture sees the app underneath.
-- Frames come when the app draws, not on a fixed beat: run.py puts them on a 60 Hz beat (sources.Clock60). An app
-  decodes its own stream, so its repeats are never quite identical: they're told from new frames by a rule learned
-  from the last few frames (cadence.DuplicateDetector(learn=True)).
+- Frames come when the app draws, not on a fixed beat: run.py puts them on a 60 Hz beat, one frame a beat, the beat
+  kept just after the frames come (sources.Steady60). Captures that are the app's last frame again (the screen
+  changed somewhere else) are left out first. An app decodes its own stream, so its repeats are never quite
+  identical: they're told from new frames by a rule learned from the last few frames
+  (cadence.DuplicateDetector(learn=True)).
+- With Windows' HDR on for the monitor, the CPU path captures the desktop as 16-bit floats and turns them into the
+  SDR picture the app drew (framegen/scrgb.py): ddagrab's 8-bit capture of an HDR desktop crushes shadows and blows
+  out everything from about 75% brightness up. FRAMEGEN_WINDOW_HDR=0 goes back to the 8-bit capture.
 - Frames are scaled to 1920x1080 (SIZE), whatever the window's size: the size Remote Play's stream has, so the
   TensorRT engines setup builds are used (a new size would build one, about a minute) and the settings fit. The
   overlay shows the result at the window's own size.
@@ -60,6 +65,15 @@ STORE_FRAME = "applicationframehost.exe"
 SKIP_EXE = {"explorer.exe", "textinputhost.exe", STORE_FRAME, "shellexperiencehost.exe",
             "searchhost.exe", "startmenuexperiencehost.exe", "systemsettings.exe", "smoovplay.exe"}
 CHECK_S = 0.5  # how often the window's place is looked at
+# CPU path: ddagrab hands on a frame whenever anything on the monitor changes, not only the window (another window,
+# a clock, a tooltip): 28% of a recorded Xbox app session's captures were the last frame again. Those are left out,
+# as the GPU path does by the dirty rectangles (framegen/dda.py); the app's own repeats are never quite identical.
+# They're told by every COPY_STRIDE-th pixel each way: about 0.1 ms at 1080p.
+COPY_STRIDE = 4
+# CPU path: a picture area within this of the stream's size is scaled with FFmpeg's fast bilinear filter: next to no
+# difference that close to 1:1, at about a third of the CPU time of its bilinear filter (11 against 33 ms of CPU
+# time a frame for 3440x1388, spread over its threads), which otherwise competes with the pipeline for the CPU.
+FAST_SCALE = 0.1
 RETRY_S = 10.0  # capture that keeps failing is tried again for this long (a screen mode change can take seconds)
 
 # Why Windows took Desktop Duplication away or refused it: DXGI's codes, as FFmpeg's ddagrab and framegen/dda.py
@@ -390,17 +404,51 @@ def plan_grab(client: Rect, monitor: Rect, device: str, outputs: list[str], hz: 
     return Grab(outputs.index(device), Rect(part.x - monitor.x, part.y - monitor.y, w, h), max(int(hz), 60))
 
 
-def graph(g: Grab, out_w: int, out_h: int) -> str:
+def graph(g: Grab, out_w: int, out_h: int, hdr: bool = False) -> str:
     """The FFmpeg filter graph: Desktop Duplication of the region, only when the screen changes, to the CPU as BGR at
-    the source's fixed size."""
+    the source's fixed size. hdr (Windows' HDR on for the monitor): as 16-bit floats in scRGB, the HDR desktop's own
+    values, for scrgb_to_bgr; ddagrab's 8-bit capture of an HDR desktop is wrong (framegen/scrgb.py)."""
     r = g.region
-    return (f"ddagrab=output_idx={g.output}:framerate={g.hz}:video_size={r.w}x{r.h}:offset_x={r.x}:offset_y={r.y}"
-            f":draw_mouse=0:dup_frames=0,hwdownload,format=bgra,scale={out_w}:{out_h}:flags=bilinear,format=bgr24")
+    grab = (f"ddagrab=output_idx={g.output}:framerate={g.hz}:video_size={r.w}x{r.h}:offset_x={r.x}:offset_y={r.y}"
+            f":draw_mouse=0:dup_frames=0")
+    if hdr:
+        return grab + ":output_fmt=16bit,hwdownload,format=rgbaf16le"
+    near = abs(r.w / out_w - 1) <= FAST_SCALE and abs(r.h / out_h - 1) <= FAST_SCALE
+    return (grab + f",hwdownload,format=bgra,scale={out_w}:{out_h}"
+            f":flags={'fast_bilinear' if near else 'bilinear'},format=bgr24")
+
+
+def scrgb_to_bgr(rgba, white: float, size: tuple[int, int]):
+    """An HDR desktop's pixels as the SDR picture they show (framegen/scrgb.py has why and how)."""
+    from .scrgb import to_bgr
+    return to_bgr(rgba, white, size)
+
+
+def hdr_white(device: str) -> float | None:
+    """Windows' SDR white level on the monitor `device`, in scRGB, if its HDR is on; None if it's off (or the HDR
+    capture is turned off with FRAMEGEN_WINDOW_HDR=0: then ddagrab's 8-bit capture, as before)."""
+    if os.environ.get("FRAMEGEN_WINDOW_HDR", "1") == "0":
+        return None
+    try:
+        from .dxgi_present import outputs, sdr_white
+        if any(o["name"].lower() == device.lower() and o["hdr"] for o in outputs()):
+            return sdr_white(device) or 2.5  # (Windows' default SDR white, 200 nits, if it can't say)
+    except Exception:  # noqa: BLE001 - can't tell: as without HDR
+        pass
+    return None
+
+
+def _rgbaf16(frame) -> np.ndarray:
+    """A PyAV rgbaf16le frame as an HxWx4 float16 array, without copying (its rows can be padded)."""
+    import numpy as np
+    p = frame.planes[0]
+    rows = np.frombuffer(p, np.float16).reshape(frame.height, p.line_size // 2)
+    return rows[:, :frame.width * 4].reshape(frame.height, frame.width, 4)
 
 
 # ----------------------------------------------------------------------------- the source
 class WindowSource:
-    """Ticks from an app's window, as the app draws them (a variable rate: wrap it in sources.Clock60). Iterate it
+    """Ticks from an app's window, as the app draws them (a variable rate: wrap it in sources.Steady60). Iterate it
     once. `where()` says where the overlay should go: (the picture area, the monitor), both in screen pixels, or
     None while the window is minimised or gone."""
 
@@ -420,10 +468,12 @@ class WindowSource:
         plan = plan_grab(self._client, mon, device, dda_outputs(), hz)
         if isinstance(plan, str):
             raise RuntimeError(f"can't capture the {target.app} window: {plan}")
-        self._grab, self._monitor = plan, mon
+        self._grab, self._monitor, self._device = plan, mon, device
+        self._said_hdr = None  # the SDR white level last said in the log (0: HDR off)
         self.w, self.h = size or (plan.region.w, plan.region.h)
         self.info = source_info("window", name=f"{target.app} window", hz=float(hz))
         self.restarts = 0
+        self.copies = 0  # CPU path: captures that were the app's last frame again, left out
         self._stop = False
         self._container = None
         self.path = "GPU" if self._open_gpu else "CPU"
@@ -453,7 +503,7 @@ class WindowSource:
             print(f"[window] {plan}")
             self._client = None
             return True
-        self._grab, self._monitor = plan, mon
+        self._grab, self._monitor, self._device = plan, mon, device
         return True
 
     def __iter__(self):
@@ -524,16 +574,102 @@ class WindowSource:
         else:
             # FFmpeg's own error lines, kept for the log: they have Windows' code (_ffmpeg_error)
             import av.logging
+            import numpy as np
             old = av.logging.get_level()
             if old is None or old < av.logging.ERROR:
                 av.logging.set_level(av.logging.ERROR)
             try:
                 with av.logging.Capture() as self._ffmpeg_logs:
-                    self._container = self._open(graph(self._grab, self.w, self.h))
+                    white = hdr_white(self._device)  # (looked at each time: switching HDR restarts the capture)
+                    if (white or 0) != self._said_hdr:
+                        self._said_hdr = white or 0
+                        if white:
+                            print(f"[window] Windows' HDR is on for this monitor: capturing in 16-bit and converting "
+                                  f"to SDR, with SDR white at {white * 80:.0f} nits")
+                    self._container = self._open(graph(self._grab, self.w, self.h, hdr=bool(white)))
+                    if white:
+                        yield from self._converted(white)
+                        return
+                    seen = None  # every COPY_STRIDE-th pixel of the last frame handed on
                     for frame in self._container.decode(video=0):
-                        yield frame.to_ndarray(), time.perf_counter(), frame.time
+                        got = frame.to_ndarray()
+                        probe = got[::COPY_STRIDE, ::COPY_STRIDE]
+                        if seen is not None and np.array_equal(probe, seen):
+                            self.copies += 1  # the screen changed somewhere else: not a frame of the app's
+                            yield None
+                            continue
+                        seen = probe
+                        yield got, time.perf_counter(), frame.time
             finally:
                 av.logging.set_level(old)
+
+    def _converted(self, white: float):
+        """Windows' HDR on: the 16-bit frames are read, and copies left out, on a thread of its own while this one
+        turns the last into SDR (scrgb_to_bgr), so a frame costs the longer of the two (waiting for the screen to
+        change, 4 to 8 ms; the conversion, about 10 ms) instead of both: one after the other they kept up with only
+        about 58 frames a second, and 39 while the PC was busy, fewer than the app's 60, so a game's frames were
+        missed. t_arrival is when the frame was read, so the conversion counts in the delay.
+
+        The reading thread closes the capture when it's done (closing it from here, mid-read, isn't safe), and
+        holds each frame until it's converted (FFmpeg reuses a frame's memory once it's let go)."""
+        import queue
+        import threading
+
+        import av.logging
+        import numpy as np
+        container, self._container = self._container, None  # (the reader's to close, not _close_container's)
+        frames: queue.Queue = queue.Queue(maxsize=2)
+        quit_ = threading.Event()
+        end = object()
+
+        def put(item) -> None:
+            while not quit_.is_set():
+                try:
+                    frames.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+        def read() -> None:
+            seen = None
+            try:
+                with av.logging.Capture() as logs:  # (FFmpeg's error lines are kept per thread)
+                    self._ffmpeg_logs = logs
+                    for frame in container.decode(video=0):
+                        if quit_.is_set() or self._stop:
+                            break
+                        raw = _rgbaf16(frame)
+                        probe = raw[::COPY_STRIDE, ::COPY_STRIDE]
+                        if seen is not None and np.array_equal(probe, seen):
+                            self.copies += 1  # the screen changed somewhere else: not a frame of the app's
+                            continue
+                        seen = probe.copy()
+                        put((frame, raw, time.perf_counter()))
+                put(end)
+            except BaseException as e:  # noqa: BLE001 - handed to the converting thread, which retries as usual
+                put(e)
+            finally:
+                try:
+                    container.close()
+                except Exception:  # noqa: BLE001 - closing
+                    pass
+
+        threading.Thread(target=read, name="window-read", daemon=True).start()
+        try:
+            while True:
+                try:
+                    item = frames.get(timeout=0.1)
+                except queue.Empty:
+                    yield None  # nothing new: the window can be looked at
+                    continue
+                if item is end:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                frame, raw, t_read = item
+                yield scrgb_to_bgr(raw, white, (self.w, self.h)), t_read, frame.time
+        finally:
+            quit_.set()
 
     def _ffmpeg_error(self) -> str:
         """FFmpeg's last error line from the capture just stopped (ddagrab's, e.g. "AcquireNextFrame failed:
@@ -553,10 +689,12 @@ class WindowSource:
 
     def close(self) -> None:
         """Stops at the next frame. The capture is closed by the thread reading it (closing it from here, mid-read,
-        isn't safe); Clock60's reader is a daemon thread, so a capture still waiting for the screen to change doesn't
+        isn't safe); Steady60's reader is a daemon thread, so a capture still waiting for the screen to change doesn't
         hold up the exit."""
         self._stop = True
-        print(f"[window] capture restarted {self.restarts} time(s) for moves; frames came through the {self.path}")
+        copies = f", {self.copies} unchanged captures left out" if self.copies else ""
+        print(f"[window] capture restarted {self.restarts} time(s) for moves; frames came through the {self.path}"
+              f"{copies}")
 
 
 def _open_lavfi(spec: str):

@@ -51,9 +51,16 @@ if __name__ == "__main__" and "--list-sources" in sys.argv:  # answered before t
 
 import argparse
 import gc
+import os
 import threading
 import time
 from pathlib import Path
+
+# PyTorch's CPU threads (OpenMP) wait for their next job by spinning, which here is the repeat check on every tick
+# when frames are on the CPU (DirectML, or window capture's CPU path): 8 cores busy the whole session on a Ryzen 7
+# 7800X3D, competing with the capture and the app being captured. Waiting asleep: 2.7 cores, every tick as fast.
+# Read when torch loads, so before it's imported.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 import cv2
 import torch
@@ -398,10 +405,10 @@ def main() -> int:
             window_keys = parse_arg(a.window_keys)
         except ValueError as e:
             ap.error(f"--window-keys: {e}")
-        from framegen.sources import Clock60
+        from framegen.sources import Steady60
         from framegen.window import open_window
         try:
-            src = Clock60(open_window(a.window))  # the app draws when it likes: put it on a 60 Hz beat
+            src = Steady60(open_window(a.window))  # the app draws when it likes: one frame a beat, at 60 Hz
         except RuntimeError as e:
             print(f"[window] {e}", file=sys.stderr)
             return 1

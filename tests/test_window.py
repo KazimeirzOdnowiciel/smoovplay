@@ -43,6 +43,13 @@ def test_graph_asks_for_changes_only_at_a_fixed_size():
     assert spec.endswith("scale=1920:1080:flags=bilinear,format=bgr24")
 
 
+def test_graph_scales_a_window_near_the_streams_size_with_the_fast_filter():
+    """A window about the stream's size (the Xbox app's 1938x1092 picture area) takes the fast filter, at a third of
+    the CPU time; a bigger change of size keeps the bilinear filter's better downscaling."""
+    assert graph(Grab(0, Rect(0, 0, 1938, 1092), 175), 1920, 1080).endswith("flags=fast_bilinear,format=bgr24")
+    assert graph(Grab(0, Rect(0, 0, 3440, 1388), 175), 1920, 1080).endswith("flags=bilinear,format=bgr24")
+
+
 # ----------------------------------------------------------------------------- picking the window
 WINDOWS = [AppWindow(11, "PS Remote Play", "remoteplay.exe", 1280, 720),
            AppWindow(12, "Xbox", "xboxpcapp.exe", 1920, 1080),
@@ -158,6 +165,7 @@ class _Desk:
         monkeypatch.setattr(window, "client_rect", lambda h: self.rects[0])
         monkeypatch.setattr(window, "monitor_of", lambda h: (MON, OUTPUTS[0], 60))
         monkeypatch.setattr(window, "dda_outputs", lambda: OUTPUTS)
+        monkeypatch.setattr(window, "hdr_white", lambda device: None)  # Windows' HDR off (unless a test says)
         monkeypatch.setattr(window, "CHECK_S", 0.0)  # look at the window after every frame
 
     def open(self, spec):
@@ -191,6 +199,67 @@ def test_source_follows_a_moving_window_and_ends_when_it_closes(monkeypatch):
     assert [t.frame.shape for t in ticks[:1]] == [(360, 640, 3)]
     assert [t.index for t in ticks] == list(range(len(ticks)))
     assert src.where()[0] == Rect(300, 100, 1280, 720)
+
+
+def test_cpu_path_leaves_out_captures_that_are_the_last_frame_again(monkeypatch):
+    """Desktop Duplication hands on a frame when anything on the monitor changes, not only the window: such a
+    capture is the app's last frame again, and would put an extra repeat in the game's rhythm. The app's own repeats
+    differ a little (it decodes them), so they're kept."""
+    desk = _Desk(monkeypatch)
+    monkeypatch.setattr(window, "CHECK_S", 10.0)
+    frames = [1, 1, 2, 3, 3, 3, 4]
+
+    def opener(spec):
+        c = _Container(spec, frames, 64, 36)
+        desk.opened.append(c)
+        return c
+
+    src = WindowSource(WINDOWS[0], size=(64, 36), open_fn=opener)
+    ticks = []
+    for t in src:
+        ticks.append(t)
+        if len(ticks) == 4:
+            src.close()
+    assert [int(t.frame[0, 0, 0]) for t in ticks] == [1, 2, 3, 4]
+    assert src.copies == 3
+    assert [t.index for t in ticks] == [0, 1, 2, 3]
+
+
+def _srgb_to_scrgb(level, white):
+    """An SDR level (0-255) as an HDR desktop holds it: linear, SDR white at `white`."""
+    v = np.asarray(level, np.float64) / 255.0
+    return white * np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+
+
+def test_graph_takes_an_hdr_desktop_as_16_bit_floats():
+    spec = graph(Grab(0, Rect(0, 0, 1902, 1072), 175), 1920, 1080, hdr=True)
+    assert spec.endswith(":dup_frames=0:output_fmt=16bit,hwdownload,format=rgbaf16le")
+    assert "scale=" not in spec  # sized by scrgb_to_bgr
+
+
+def test_with_windows_hdr_on_the_window_is_captured_in_16_bit_and_converted(monkeypatch, capsys):
+    desk = _Desk(monkeypatch)
+    monkeypatch.setattr(window, "CHECK_S", 10.0)
+    monkeypatch.setattr(window, "hdr_white", lambda device: 2.5 if device == OUTPUTS[0] else None)
+    pictures = {i: np.full((36, 64, 4), _srgb_to_scrgb(v, 2.5), np.float16) for i, v in ((1, 64), (2, 128), (3, 200))}
+    monkeypatch.setattr(window, "_rgbaf16", lambda frame: pictures[frame.i])
+
+    def opener(spec):
+        c = _Container(spec, [1, 2, 2, 3], 64, 36)
+        desk.opened.append(c)
+        return c
+
+    src = WindowSource(WINDOWS[0], size=(32, 18), open_fn=opener)
+    ticks = []
+    for t in src:
+        ticks.append(t)
+        if len(ticks) == 3:
+            src.close()
+    assert "output_fmt=16bit" in desk.opened[0].spec
+    assert [t.frame.shape for t in ticks] == [(18, 32, 3)] * 3
+    assert [int(t.frame[0, 0, 0]) for t in ticks] == [64, 128, 200]  # (the copy of 2 left out, as without HDR)
+    out = capsys.readouterr().out
+    assert "HDR is on for this monitor" in out and "SDR white at 200 nits" in out
 
 
 def test_overlay_covers_what_is_captured_when_the_window_hangs_off_the_screen(monkeypatch):
@@ -369,6 +438,55 @@ def test_rhythm_lets_go_of_a_hitch_and_finds_the_new_beat():
     assert got[60] is False  # an exact repeat is a repeat, whatever the rhythm says
     assert d.rhythm is not None  # found again
     assert got[40:] == truth[40:]
+
+
+def _levels(diffs, repeat_noise=0.0, seed=4):
+    """Frames (8x8 blocks, one value each) whose mean difference from the frame before is diffs[i]; a diff of 0 is a
+    decoded repeat: repeat_noise on a fifth of the blocks."""
+    rng = np.random.default_rng(seed)
+    base, frames = np.full((8, 8, 3), 100.0, np.float32), []
+    for d in diffs:
+        if d:
+            base = base + d * rng.choice([-1.0, 1.0])
+            frames.append(torch.from_numpy(base.copy()))
+        else:
+            f = base.copy()
+            f[rng.random((8, 8)) < 0.2] += repeat_noise
+            frames.append(torch.from_numpy(f))
+    return frames
+
+
+def test_a_found_rhythm_holds_through_a_scene_with_little_motion():
+    """An Xbox app stream: new frames moved 0.2 to 0.6 in a still scene and its repeats 0.06 to 0.1, too close for
+    LEARN_RATIO. Once the game's rhythm is found in motion, it's kept through such a scene (KEEP_RATIO)."""
+    rng = np.random.default_rng(2)
+    moving = [float(rng.uniform(4, 9)) if i % 2 == 0 else 0 for i in range(60)]
+    still = [float(rng.uniform(0.25, 0.32)) if i % 2 == 0 else 0 for i in range(80)]
+    frames = _levels(moving + still, repeat_noise=0.45)
+    truth = [d > 0 for d in moving + still]
+    d = DuplicateDetector(learn=True, block=1)
+    got = [d.update(f).is_new for f in frames]
+    assert got[40:] == truth[40:]
+    assert d.rhythm is not None
+    fresh = DuplicateDetector(learn=True, block=1)  # the still scene alone: no rhythm to keep, the fixed rule calls it
+    alone = [fresh.update(f).is_new for f in _levels(still, repeat_noise=0.45)]
+    assert sum(a != t for a, t in zip(alone, truth[60:])) >= 30
+
+
+def test_a_60fps_game_is_not_split_into_new_frames_and_repeats():
+    """Every frame new, its motion varying about threefold from frame to frame: no rhythm, so LEARN_RATIO decides,
+    and the frames stay new. (KEEP_RATIO alone would call some of them repeats.)"""
+    rng = np.random.default_rng(6)
+    diffs = [float(np.exp(rng.uniform(np.log(2.5), np.log(15)))) for _ in range(200)]
+    d = DuplicateDetector(learn=True, block=1)
+    assert all(d.update(f).is_new for f in _levels(diffs)[1:])
+    assert d.rhythm is None
+
+    class Low(DuplicateDetector):
+        LEARN_RATIO = DuplicateDetector.KEEP_RATIO
+
+    low = Low(learn=True, block=1)
+    assert not all(low.update(f).is_new for f in _levels(diffs)[1:])
 
 
 def test_rhythm_lets_go_when_the_game_speeds_up():

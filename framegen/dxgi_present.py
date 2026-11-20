@@ -275,6 +275,51 @@ class _Point(ctypes.Structure):
     _fields_ = [("x", c_long), ("y", c_long)]
 
 
+def sdr_white(device: str) -> float | None:
+    """The SDR white level Windows uses on a display (`device`, e.g. \\\\.\\DISPLAY1) with its HDR on: SDR content's
+    white, in scRGB (1.0 = 80 nits; Settings' "SDR content brightness" moves it, 2.5 = 200 nits). None if Windows
+    can't say (an older Windows, or the display isn't found)."""
+    from ctypes import wintypes as wt
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("low", wt.DWORD), ("high", wt.LONG)]
+
+    class PathInfo(ctypes.Structure):  # DISPLAYCONFIG_PATH_INFO: its source and target, as raw fields
+        _fields_ = [("src_adapter", Luid), ("src_id", c_uint), ("src_mode", c_uint), ("src_flags", c_uint),
+                    ("dst_adapter", Luid), ("dst_id", c_uint), ("dst_rest", c_uint * 9), ("flags", c_uint)]
+
+    class Header(ctypes.Structure):  # DISPLAYCONFIG_DEVICE_INFO_HEADER
+        _fields_ = [("type", c_uint), ("size", c_uint), ("adapter", Luid), ("id", c_uint)]
+
+    class SourceName(ctypes.Structure):  # DISPLAYCONFIG_SOURCE_DEVICE_NAME
+        _fields_ = [("header", Header), ("name", wt.WCHAR * 32)]
+
+    class WhiteLevel(ctypes.Structure):  # DISPLAYCONFIG_SDR_WHITE_LEVEL
+        _fields_ = [("header", Header), ("level", wt.ULONG)]
+
+    try:
+        u32 = ctypes.WinDLL("user32")
+        n_paths, n_modes = c_uint(), c_uint()
+        if u32.GetDisplayConfigBufferSizes(2, byref(n_paths), byref(n_modes)):  # QDC_ONLY_ACTIVE_PATHS
+            return None
+        paths = (PathInfo * n_paths.value)()
+        modes = (ctypes.c_byte * (64 * max(1, n_modes.value)))()  # DISPLAYCONFIG_MODE_INFO is 64 bytes
+        if u32.QueryDisplayConfig(2, byref(n_paths), paths, byref(n_modes), modes, None):
+            return None
+        for p in paths[:n_paths.value]:
+            name = SourceName()
+            name.header = Header(1, ctypes.sizeof(SourceName), p.src_adapter, p.src_id)  # GET_SOURCE_NAME
+            if u32.DisplayConfigGetDeviceInfo(byref(name)) or name.name.lower() != device.lower():
+                continue
+            white = WhiteLevel()
+            white.header = Header(11, ctypes.sizeof(WhiteLevel), p.dst_adapter, p.dst_id)  # GET_SDR_WHITE_LEVEL
+            if u32.DisplayConfigGetDeviceInfo(byref(white)) == 0 and white.level:
+                return white.level / 1000.0
+    except (OSError, AttributeError):
+        return None
+    return None
+
+
 def display_hdr(hwnd=None) -> dict | None:
     """The display a window is on (most of it), or without one the main display, from outputs(); None if unknown."""
     u32 = ctypes.WinDLL("user32")

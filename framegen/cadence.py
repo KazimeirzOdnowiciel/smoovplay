@@ -102,9 +102,15 @@ class DuplicateDetector:
     the way, in log terms, from the line to the other band) is called as the rhythm says. A clear exception (a
     hitch, a cut to a 60 fps menu) drops the rhythm, as does losing the two bands; it's found again after
     RHYTHM_N steady frames. `held` counts the calls the rhythm made.
+
+    While a rhythm is kept, two bands KEEP_RATIO apart are enough: in a scene with little motion, an Xbox app
+    stream's new frames moved 0.2 to 0.6 and its repeats 0.06 to 0.1, too close for LEARN_RATIO, so the fixed rule
+    took over and called the game 35 to 45 fps (switching Even out 40-60 fps on). Finding a rhythm still takes
+    LEARN_RATIO, so a 60 fps game, which never alternates for RHYTHM_N frames, is read as before: lowering
+    LEARN_RATIO itself to 2.5 called 4 to 10% of a 60 fps stand-in's frames repeats, against 0 to 6%.
     """
 
-    LEARN_N, LEARN_MIN, LEARN_RATIO = 16, 8, 4.0
+    LEARN_N, LEARN_MIN, LEARN_RATIO, KEEP_RATIO = 16, 8, 4.0, 2.5
     RHYTHM_N, RHYTHM_PERIODS, SURE = 24, (2, 3), 0.5
 
     def __init__(self, threshold: float = 2.0, block: int = 16, reference: str = "previous",
@@ -129,7 +135,7 @@ class DuplicateDetector:
         xs = sorted(self._means)
         lo = max(xs[round(0.2 * (len(xs) - 1))], 1e-3)
         hi = xs[round(0.8 * (len(xs) - 1))]
-        if hi <= self.LEARN_RATIO * lo:
+        if hi <= (self.KEEP_RATIO if self.rhythm is not None else self.LEARN_RATIO) * lo:
             return None
         line = math.sqrt(lo * hi)
         return mean > line, abs(math.log(max(mean, 1e-6) / line)) / math.log(hi / line)

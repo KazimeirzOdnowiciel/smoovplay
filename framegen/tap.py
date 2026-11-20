@@ -9,7 +9,7 @@ A writer sends either kind of frame:
   (FLAG_NEW / FLAG_REPEAT), else the pictures are compared (framegen.sources.make_detector, as for an app's window).
 
 A writer that sends a frame only when the picture changes sets FEATURE_VARIABLE, and run.py puts it on a 60 Hz beat
-(framegen.sources.Clock60), as for window capture.
+(framegen.sources.Clock60). (Window capture uses Steady60, one picture a beat: not yet tried with a tap writer.)
 
     python run.py --source tap [--tap NAME] --display
     python scripts/frametap_send.py VIDEO [--format nv12|bgra]   # a stand-in writer, in another terminal

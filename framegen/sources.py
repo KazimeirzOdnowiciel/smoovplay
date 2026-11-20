@@ -7,8 +7,10 @@ is like instead of checking which class it is.
 Shared pieces:
   TestMode       "Simulate a 30 fps game": a 60 fps game played as if it were 30 fps, with the frames it leaves
                  out kept to score the generated ones against. Works with any 60 Hz source.
-  Clock60        puts a source whose frames come at uneven times (window capture, a Moonlight stream) onto a
+  Clock60        puts a source whose frames come at uneven times (a Moonlight stream through the frame tap) onto a
                  steady 60 Hz beat, the way a console's HDMI output delivers them.
+  Steady60       the same for an app's window, one frame a beat, with the beat kept just after the frames come
+                 (BeatBuffer), so a frame a little late doesn't put a 30 fps game out of step.
   make_detector  the repeat detector that suits a source.
 
 `python -m framegen.sources --json` (or `run.py --list-sources --json`) lists the sources for the launcher. It
@@ -201,6 +203,126 @@ class Clock60:
                        t_ready=handed, t_source=latest.t_source, extra=dict(latest.extra) if fresh else {})
             index += 1
             beat += self.period
+            now = self._clock()
+            if beat < now - self.period:  # fell a whole beat behind (the pipeline stalled): restart the beat from now
+                beat = now
+            elif beat > now:
+                self._sleep(beat - now)
+
+
+class BeatBuffer:
+    """The steady beat for an app's window (Steady60), without the threads: every frame the app draws is queued,
+    and each beat hands on the oldest one, so each frame gets a beat of its own and none is overtaken.
+
+    Why: an app draws its stream when frames come off the network, and the desktop shows them on its own refresh,
+    so frames reach the screen unevenly. On a 175 Hz desktop, a 60 Hz Xbox app stream's frames came 5.7 to 28.6 ms
+    apart (in steps of the desktop's 5.7 ms refresh). Clock60 hands on the newest frame on each beat of a clock of
+    its own: a frame a little late lands a beat later, the beat before gets a repeat and the one after gets two
+    frames (one overtaken), so a 30 fps game's new, repeat, new, repeat comes out of step about one beat in five.
+    That read as a game at 35 to 45 fps and switched Even out 40-60 fps on and off (issue 33's log, and the same
+    in a recorded Xbox session: 0 to 28% of the time, by where Clock60's beat happened to fall).
+
+    The beat is steered to just after the frames come: over the last WINDOW frames handed on, the shortest wait
+    for the beat is kept near MARGIN, moving the beat by at most STEP a beat (so it follows an app slightly
+    faster or slower than 60 Hz). A beat that found nothing, followed within half a beat by a frame, was early:
+    the next beat comes STEP later. More than MAX_QUEUE frames waiting (the pipeline stalled, or the app draws
+    faster than the beat) drops the oldest: they're counted in `dropped`.
+
+    In two recorded Xbox app sessions, 92.5% and 88.1% of the game's frames were on screen for exactly two beats,
+    close to the app's own 93.8% and 90.2% (Clock60: 74 to 81%, and 7 to 10% for a single beat, a stutter), and
+    Even out 40-60 fps no longer switched on in scenes with motion. A frame waits about 12 to 17 ms for its beat
+    (median; Clock60: 6 ms), the price of an even picture from uneven frames; in a stand-in session through the
+    whole pipeline, the delay to the screen stayed the same at the median and fell from 64 to 46 ms at the 95th
+    percentile, with Even out 40-60 fps off.
+    """
+
+    MARGIN, STEP, GAIN, WINDOW, MAX_QUEUE = 0.002, 0.0005, 0.1, 30, 2
+
+    def __init__(self, period: float) -> None:
+        from collections import deque
+        self.period = period
+        self._queue: deque = deque()  # (item, its arrival), oldest first
+        self._waits: deque = deque(maxlen=self.WINDOW)  # how long the last frames handed on waited for their beat
+        self._empty_at: float | None = None  # the last beat, if it found nothing to hand on
+        self._early = False  # a frame came soon after a beat that found nothing
+        self.dropped = 0
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def put(self, item, t_arrival: float) -> None:
+        if self._empty_at is not None and t_arrival - self._empty_at < 0.5 * self.period:
+            self._early = True
+        self._empty_at = None
+        self._queue.append((item, t_arrival))
+
+    def take(self, now: float):
+        """The beat at `now`: the oldest frame waiting, or None (a repeat)."""
+        while len(self._queue) > self.MAX_QUEUE:
+            self._queue.popleft()
+            self.dropped += 1
+        if not self._queue:
+            self._empty_at = now
+            return None
+        item, t_arrival = self._queue.popleft()
+        self._waits.append(now - t_arrival)
+        return item
+
+    def next_beat(self, beat: float) -> float:
+        """When the beat after the one at `beat` falls."""
+        shift = 0.0
+        if self._early:
+            self._early, shift = False, self.STEP
+        elif len(self._waits) >= 5:
+            shift = -max(-self.STEP, min(self.STEP, self.GAIN * (min(self._waits) - self.MARGIN)))
+        return beat + self.period + shift
+
+
+class Steady60(Clock60):
+    """Clock60 for an app's window: each frame the app draws is handed on, one a beat, the beat kept just after the
+    frames come (BeatBuffer has why). A beat with nothing new is a repeat for certain (new_hint False), as with
+    Clock60, and so are t_arrival and t_ready. Frames dropped because too many were waiting are in `overtaken`."""
+
+    def __init__(self, source, hz: float = 60.0, clock=time.perf_counter, sleep=time.sleep) -> None:
+        super().__init__(source, hz, clock, sleep)
+        self.buffer = BeatBuffer(self.period)
+
+    def _reader(self) -> None:
+        from .io import Waiting
+        try:
+            for tick in self.source:
+                if isinstance(tick, Waiting):
+                    continue
+                with self._cond:
+                    self.buffer.put(tick, tick.t_arrival)
+                    self._latest = self._latest or tick
+                    self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._done = True
+                self._cond.notify_all()
+
+    def __iter__(self):
+        from .io import Tick
+        threading.Thread(target=self._reader, name="steady60", daemon=True).start()
+        with self._cond:
+            self._cond.wait_for(lambda: self._latest is not None or self._done)
+        beat, index, last = self._clock(), 0, None
+        while True:
+            handed = self._clock()  # the beat, or a moment after it if the sleep overshot
+            with self._cond:
+                fresh, done = self.buffer.take(handed), self._done
+                self.overtaken = self.buffer.dropped
+            if fresh is None and (done or last is None):
+                return
+            if fresh is not None:
+                last = fresh
+                yield replace(fresh, index=index, t_ready=handed, extra=dict(fresh.extra))
+            else:
+                yield Tick(last.frame, handed, index, last.content, None, new_hint=False, t_ready=handed,
+                           t_source=last.t_source)
+            index += 1
+            beat = self.buffer.next_beat(beat)
             now = self._clock()
             if beat < now - self.period:  # fell a whole beat behind (the pipeline stalled): restart the beat from now
                 beat = now

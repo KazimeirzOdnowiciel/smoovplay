@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from framegen.io import CaptureSource, FileSource, Ps5SimSource, Tick, Waiting
-from framegen.sources import Clock60, TestMode, list_sources, make_detector, source_info
+from framegen.sources import BeatBuffer, Clock60, Steady60, TestMode, list_sources, make_detector, source_info
 
 ROOT = Path(__file__).resolve().parent.parent
 W, H = 128, 96
@@ -195,6 +195,97 @@ def test_clock60_puts_uneven_frames_on_a_steady_beat():
     assert [t.index for t in out] == list(range(len(out)))
     clock.close()
     assert clock.source.closed  # passed through to the source
+
+
+def _app_frames(n, hz=60.0, seed=3):
+    """When an app's frames reach the desktop: one every 1/hz s, each shown on the next of a 175 Hz desktop's
+    refreshes after a delay of 0 to 11 ms, as in a recorded Xbox app session (frames 5.7 to 28.6 ms apart)."""
+    rng = np.random.default_rng(seed)
+    refresh = 1 / 175
+    return [np.ceil((k / hz + rng.uniform(0, 0.011)) / refresh) * refresh for k in range(n)]
+
+
+def _beats(times, take):
+    """Runs a beat over frames that come at `times`: take(arrived, beat) -> the frame handed on, or None; the beat
+    after it comes from take.next_beat if there is one, else 1/60 s later."""
+    out, beat, j = [], times[0], 0
+    while beat < times[-1] + 0.05:
+        arrived = []
+        while j < len(times) and times[j] <= beat:
+            arrived.append(j)
+            j += 1
+        out.append(take(arrived, beat))
+        beat = take.next_beat(beat) if hasattr(take, "next_beat") else beat + 1 / 60
+    return out
+
+
+def test_beat_buffer_hands_on_every_frame_of_an_uneven_app_once_in_order():
+    """A 30 fps game in a 60 Hz app's window: new, repeat, new, repeat... Handed on one a beat, every frame keeps its
+    place; Clock60's newest-on-each-beat lets a frame a little late fall a beat behind, putting the game out of step
+    (issue 33: read as a game at 35 to 45 fps)."""
+    times = _app_frames(600)
+    buf = BeatBuffer(1 / 60)
+
+    class Take:
+        def __call__(self, arrived, beat):
+            for k in arrived:
+                buf.put(k, times[k])
+            return buf.take(beat)
+        next_beat = buf.next_beat
+
+    beats = _beats(times, Take())
+    handed = [k for k in beats if k is not None]
+    assert handed == sorted(set(handed)) and buf.dropped == 0
+    assert len(handed) >= len(times) - 2  # (the last one or two may still be waiting at the end)
+
+    def out_of_step(beats):
+        """The share of beats where new, repeat, new, repeat broke (a beat with nothing counts as a repeat)."""
+        calls = [k is not None and k % 2 == 0 for k in beats]
+        return sum(a == b for a, b in zip(calls, calls[1:])) / len(calls)
+
+    def newest(arrived, beat):  # Clock60's way, for comparison
+        return arrived[-1] if arrived else None
+
+    assert out_of_step(beats) < 0.02
+    assert out_of_step(_beats(times, newest)) > 0.05
+
+
+@pytest.mark.parametrize("hz", [59.5, 60.5])
+def test_beat_buffer_follows_an_app_a_little_off_60hz(hz):
+    times = _app_frames(1200, hz)
+    buf = BeatBuffer(1 / 60)
+    waits = []
+
+    class Take:
+        def __call__(self, arrived, beat):
+            for k in arrived:
+                buf.put(k, times[k])
+            k = buf.take(beat)
+            if k is not None:
+                waits.append(beat - times[k])
+            return k
+        next_beat = buf.next_beat
+
+    _beats(times, Take())
+    assert len(buf) <= BeatBuffer.MAX_QUEUE
+    assert max(waits[200:]) < 2 / 60  # the beat keeps up: frames never wait two beats
+    assert buf.dropped <= 0.012 * len(times)  # a faster app loses about one frame in 120, no more
+
+
+def test_steady60_hands_on_every_frame_one_a_beat():
+    gaps = [0.0, 0.035, 0.004, 0.006, 0.03, 0.012, 0.03]
+    clock = Steady60(_Uneven(gaps), hz=100)
+    out = list(clock)
+    fresh = [t for t in out if t.new_hint is None]
+    assert [int(t.frame[0, 0, 0]) for t in fresh] == list(range(len(gaps)))  # each frame, once, in order
+    assert clock.overtaken == 0
+    for prev, t in zip(out, out[1:]):
+        if t.new_hint is False:
+            assert t.frame is prev.frame and not t.damaged
+    assert all(t.t_ready >= t.t_arrival for t in out)
+    assert [t.index for t in out] == list(range(len(out)))
+    clock.close()
+    assert clock.source.closed
 
 
 # ----------------------------------------------------------------------------- repeat detector per source

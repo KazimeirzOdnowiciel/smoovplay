@@ -145,7 +145,7 @@ frame.
   fit in 64 MiB, SmoovPlay uses version 1's.
 - Send one frame per refresh, repeats included. Set flag bit 1 or 2 if you know which frames are repeats.
 - If your app draws only when it likes, set feature 8 and send each picture once. SmoovPlay then puts the pictures on
-  a steady 60 Hz beat, as it does for window capture.
+  a steady 60 Hz beat, the newest picture on each beat.
 
 ## Sound (optional)
 
